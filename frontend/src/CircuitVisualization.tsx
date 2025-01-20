@@ -17,38 +17,32 @@ import { ChevronLeft, ChevronRight, Play } from 'lucide-react';
 import { Switch } from '@/components/ui/switch';
 import { Checkbox } from '@/components/ui/checkbox';
 
+//
 // ----------------------------------------------------------------------
+// Configuration & Constants
+// ----------------------------------------------------------------------
+const BACKEND_URL = 'http://194.68.245.78:22119';
+
 // Example prompts
-// ----------------------------------------------------------------------
 const EXAMPLES = [
   `predict: ages["Bob"]`,
   `predict: prices["Apples"]`,
   `predict: dictionary["Hello"]`,
 ];
 
-// ----------------------------------------------------------------------
 // We assume the same layers in the front end as in the backend
-// ----------------------------------------------------------------------
 const LAYERS = [7, 21, 40];
 
-// ----------------------------------------------------------------------
-// In the backend, these layers map to array indices [0,1,2] for
-// latentActivations. We'll define an index map to help interpret them.
-// ----------------------------------------------------------------------
+// Map layerId -> index in latentActivations
 const layerIndexMap: Record<number, number> = {};
 LAYERS.forEach((layerId, idx) => {
   layerIndexMap[layerId] = idx;
 });
 
-// ----------------------------------------------------------------------
-// Single "global" cluster definitions.
-// ----------------------------------------------------------------------
+// Global cluster definitions
 const CLUSTERS: Record<
   number,
-  Record<
-    number,
-    Record<string, number[]>
-  >
+  Record<number, Record<string, number[]>>
 > = {
   7: {
     1: {},
@@ -73,8 +67,9 @@ const CLUSTERS: Record<
   },
 };
 
+//
 // ----------------------------------------------------------------------
-// Build an initial clusterStates object for a given token count
+// Helpers: initialize cluster states, check ablation, build columns
 // ----------------------------------------------------------------------
 function initClusterStatesForTokens(tokenCount: number) {
   const result: Record<
@@ -85,7 +80,7 @@ function initClusterStatesForTokens(tokenCount: number) {
         [clusterName: string]: {
           enabled: boolean;
           latents: Record<number, boolean>;
-        }
+        };
       }
     >
   > = {};
@@ -93,7 +88,6 @@ function initClusterStatesForTokens(tokenCount: number) {
   for (const layerId of LAYERS) {
     result[layerId] = {};
     for (let t = 0; t < tokenCount; t++) {
-      // If no definition => ablated => no clusters
       const def = CLUSTERS[layerId]?.[t] || {};
       const clusterMap: any = {};
       for (const [clusterName, latentIds] of Object.entries(def)) {
@@ -113,26 +107,21 @@ function initClusterStatesForTokens(tokenCount: number) {
   return result;
 }
 
-// ----------------------------------------------------------------------
-// Check if token index is ablated across all layers => no clusters
-// ----------------------------------------------------------------------
+// Is a token ablated across all layers => no clusters at all?
 function isTokenAblatedAcrossAllLayers(
   clusterStates: ReturnType<typeof initClusterStatesForTokens>,
   tokenIdx: number
 ) {
   for (const layerId of LAYERS) {
     const clusterMap = clusterStates[layerId]?.[tokenIdx];
-    const clusterNames = Object.keys(clusterMap || {});
-    if (clusterNames.length > 0) {
+    if (clusterMap && Object.keys(clusterMap).length > 0) {
       return false;
     }
   }
   return true;
 }
 
-// ----------------------------------------------------------------------
 // Merge consecutive ablated tokens into a single "column"
-// ----------------------------------------------------------------------
 function buildColumns(
   clusterStates: ReturnType<typeof initClusterStatesForTokens>,
   tokens: string[]
@@ -154,7 +143,6 @@ function buildColumns(
       });
       i++;
     } else {
-      // gather run of consecutive ablated
       const start = i;
       let end = i;
       while (
@@ -163,7 +151,7 @@ function buildColumns(
       ) {
         end++;
       }
-      const chunk = tokens.slice(start, end).join(" + ");
+      const chunk = tokens.slice(start, end).join(' + ');
       columns.push({
         ablated: true,
         tokenIdxs: Array.from({ length: end - start }, (_, k) => start + k),
@@ -176,26 +164,115 @@ function buildColumns(
   return columns;
 }
 
+//
+// ----------------------------------------------------------------------
+// Build toggles & requested latents
+// ----------------------------------------------------------------------
+// toggles[layerId][tokenIndex] = array of latents we want "on"
+function buildToggles(
+  clusterStates: ReturnType<typeof initClusterStatesForTokens>,
+  tokens: string[]
+) {
+  const toggles: Record<number, Record<number, number[]>> = {};
+  for (const layerId of LAYERS) {
+    toggles[layerId] = {};
+    for (let t = 0; t < tokens.length; t++) {
+      const clusterMap = clusterStates[layerId][t];
+      if (!clusterMap) {
+        toggles[layerId][t] = [];
+        continue;
+      }
+      const latentsOn: number[] = [];
+      for (const info of Object.values(clusterMap)) {
+        const cInfo = info as {
+          enabled: boolean;
+          latents: Record<number, boolean>;
+        };
+        if (cInfo.enabled) {
+          for (const [latentIdStr, isOn] of Object.entries(cInfo.latents)) {
+            if (isOn) {
+              latentsOn.push(parseInt(latentIdStr));
+            }
+          }
+        }
+      }
+      toggles[layerId][t] = latentsOn;
+    }
+  }
+  return toggles;
+}
+
+/**
+ * Build a "requestedLatents" object that includes ALL latents from CLUSTERS,
+ * for each (layerId, tokenIdx), regardless of whether they're toggled on/off.
+ * 
+ * returned shape: {
+ *   [layerId: number]: {
+ *     [tokenIdx: number]: number[]  // array of latents
+ *   }
+ * }
+ */
+function buildRequestedLatents(tokenCount: number) {
+  const requested: Record<number, Record<number, Set<number>>> = {};
+
+  // Initialize sets
+  for (const layerId of LAYERS) {
+    requested[layerId] = {};
+    for (let t = 0; t < tokenCount; t++) {
+      requested[layerId][t] = new Set<number>();
+    }
+  }
+
+  // Go through global CLUSTERS object
+  for (const layerId of LAYERS) {
+    const definitionForLayer = CLUSTERS[layerId] || {};
+    for (const [tokenIdxStr, clusterMap] of Object.entries(definitionForLayer)) {
+      const tokenIdx = parseInt(tokenIdxStr);
+      for (const latentIds of Object.values(clusterMap)) {
+        latentIds.forEach((lid) => {
+          requested[layerId][tokenIdx].add(lid);
+        });
+      }
+    }
+  }
+
+  // Convert Sets to arrays
+  const requestedLatents: Record<number, Record<number, number[]>> = {};
+  for (const layerId of LAYERS) {
+    requestedLatents[layerId] = {};
+    for (let t = 0; t < tokenCount; t++) {
+      requestedLatents[layerId][t] = Array.from(requested[layerId][t]);
+    }
+  }
+
+  return requestedLatents;
+}
+
+//
+// ----------------------------------------------------------------------
+// Main Component
+// ----------------------------------------------------------------------
 const CircuitVisualization = () => {
   // Which example index
   const [exampleIndex, setExampleIndex] = useState(0);
   const currentExample = EXAMPLES[exampleIndex];
 
-  // We'll store the currently displayed tokens in a single array
+  // Tokens from /tokenize
   const [tokens, setTokens] = useState<string[]>([]);
 
-  // Single clusterStates for the entire app (not per prompt)
-  const [clusterStates, setClusterStates] = useState<ReturnType<
-    typeof initClusterStatesForTokens
-  > | null>(null);
+  // Single clusterStates for the entire app
+  const [clusterStates, setClusterStates] = useState<
+    ReturnType<typeof initClusterStatesForTokens> | null
+  >(null);
 
-  // "needRerun" indicates toggles changed or user switched examples
-  // so the displayed results are out of date
+  // "needRerun" indicates toggles changed or new tokens
   const [needRerun, setNeedRerun] = useState(false);
 
   // The results from the last run
   const [topProbs, setTopProbs] = useState<Record<string, number> | null>(null);
-  const [latentActivations, setLatentActivations] = useState<any>(null);
+  const [latentActivations, setLatentActivations] = useState<
+    Array<Array<Record<number, number>>> | null
+  >(null);
 
   // We'll store computed activation fraction for each cluster
   const [activationValues, setActivationValues] = useState<any>({});
@@ -215,44 +292,67 @@ const CircuitVisualization = () => {
   const tableRef = useRef<HTMLDivElement | null>(null);
   const cellRefs = useRef<Record<string, HTMLTableCellElement | null>>({});
 
-  // Build columns if we have tokens + clusterStates
-  const columns = clusterStates
-    ? buildColumns(clusterStates, tokens)
-    : [];
+  // Dynamically build columns if we have clusterStates + tokens
+  const columns = clusterStates ? buildColumns(clusterStates, tokens) : [];
 
+  //
   // ----------------------------------------------------------------
-  // Example navigation
+  // 1) Tokenize step
   // ----------------------------------------------------------------
-  function handlePrevExample() {
-    if (exampleIndex > 0) {
-      setExampleIndex(exampleIndex - 1);
-      setNeedRerun(true);
-      // Clear old display results
+  async function fetchTokensForPrompt(prompt: string) {
+    try {
+      const res = await fetch(`${BACKEND_URL}/tokenize`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt }),
+      });
+      const data = await res.json();
+
+      // data has: { prompt, tokens }
+      const newTokens = data.tokens || [];
+      setTokens(newTokens);
+      // Build clusterStates for these tokens
+      const newCS = initClusterStatesForTokens(newTokens.length);
+      setClusterStates(newCS);
+
+      // Clear old activations & topProbs
       setTopProbs(null);
       setLatentActivations(null);
       setActivationValues({});
+      setNeedRerun(true);
+    } catch (err) {
+      console.error('Error in /tokenize:', err);
+    }
+  }
+
+  // Called when user changes example
+  function handlePrevExample() {
+    if (exampleIndex > 0) {
+      const newIndex = exampleIndex - 1;
+      setExampleIndex(newIndex);
+      fetchTokensForPrompt(EXAMPLES[newIndex]);
     }
   }
   function handleNextExample() {
     if (exampleIndex < EXAMPLES.length - 1) {
-      setExampleIndex(exampleIndex + 1);
-      setNeedRerun(true);
-      // Clear old display results
-      setTopProbs(null);
-      setLatentActivations(null);
-      setActivationValues({});
+      const newIndex = exampleIndex + 1;
+      setExampleIndex(newIndex);
+      fetchTokensForPrompt(EXAMPLES[newIndex]);
     }
   }
 
+  // We'll fetch tokens initially for the first example
+  React.useEffect(() => {
+    // Only do this on first render:
+    fetchTokensForPrompt(currentExample);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  //
   // ----------------------------------------------------------------
-  // Toggling clusters
+  // 2) Toggling Clusters / Latents
   // ----------------------------------------------------------------
-  function toggleCluster(
-    layerId: number,
-    tokenIdx: number,
-    clusterName: string,
-    enabled: boolean
-  ) {
+  function toggleCluster(layerId: number, tokenIdx: number, clusterName: string, enabled: boolean) {
     if (!clusterStates) return;
     setClusterStates((prev) => {
       if (!prev) return prev;
@@ -261,18 +361,11 @@ const CircuitVisualization = () => {
       const oldCluster = newTokenObj[clusterName];
       newTokenObj[clusterName] = { ...oldCluster, enabled };
       newLayerObj[tokenIdx] = newTokenObj;
-
-      return {
-        ...prev,
-        [layerId]: newLayerObj,
-      };
+      return { ...prev, [layerId]: newLayerObj };
     });
     setNeedRerun(true);
   }
 
-  // ----------------------------------------------------------------
-  // Toggling an individual latent
-  // ----------------------------------------------------------------
   function toggleLatent(
     layerId: number,
     tokenIdx: number,
@@ -294,130 +387,85 @@ const CircuitVisualization = () => {
         },
       };
       newLayerObj[tokenIdx] = newTokenObj;
-
-      return {
-        ...prev,
-        [layerId]: newLayerObj,
-      };
+      return { ...prev, [layerId]: newLayerObj };
     });
     setNeedRerun(true);
   }
 
+  //
   // ----------------------------------------------------------------
-  // Build toggles for the backend
-  // toggles[layerId][tokenIndex] = array of latents we want "on"
-  // ----------------------------------------------------------------
-  function buildToggles() {
-    const toggles: Record<number, Record<number, number[]>> = {};
-    if (!clusterStates) return toggles;
-
-    for (const layerId of LAYERS) {
-      toggles[layerId] = {};
-      for (let t = 0; t < tokens.length; t++) {
-        const clusterMap = clusterStates[layerId][t];
-        if (!clusterMap) {
-          toggles[layerId][t] = [];
-          continue;
-        }
-        const latentsOn: number[] = [];
-        for (const info of Object.values(clusterMap)) {
-          const cInfo = info as {
-            enabled: boolean;
-            latents: Record<number, boolean>;
-          };
-          if (cInfo.enabled) {
-            for (const [latentIdStr, isOn] of Object.entries(cInfo.latents)) {
-              if (isOn) latentsOn.push(parseInt(latentIdStr));
-            }
-          }
-        }
-        toggles[layerId][t] = latentsOn;
-      }
-    }
-    return toggles;
-  }
-
-  // ----------------------------------------------------------------
-  // Run circuit => call backend => get tokens & latentActivations
+  // 3) Run step (fetch minimal activations + apply toggles)
   // ----------------------------------------------------------------
   async function runCircuit() {
-    const payload = {
-      prompt: currentExample,
-      toggles: buildToggles(),
-    };
+    if (!clusterStates) {
+      alert('No cluster states found. Try retokenizing first.');
+      return;
+    }
+    // Build toggles
+    const toggles = buildToggles(clusterStates, tokens);
+    // Build requestedLatents
+    const requestedLatents = buildRequestedLatents(tokens.length);
 
     try {
-      const res = await fetch('http://localhost:4000/runWithLatentMask', {
+      const payload = {
+        prompt: currentExample,
+        toggles,
+        requestedLatents,
+      };
+      const res = await fetch(`${BACKEND_URL}/runWithLatentMask`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
       const data = await res.json();
 
-      // data should have data.prompt, data.tokens, data.result.topProbs, data.result.latentActivations
       const { tokens: newTokens, result } = data;
       const { topProbs, latentActivations } = result || {};
 
-      // If we have no clusterStates yet, initialize them
-      // Otherwise, check that the new tokens match in length
-      if (!clusterStates) {
-        const newCS = initClusterStatesForTokens(newTokens.length);
-        setClusterStates(newCS);
-        setTokens(newTokens);
-      } else {
-        if (newTokens.length !== tokens.length) {
-          // Show an error or do something if lengths differ
-          alert(
-            `Error: new tokens length (${newTokens.length}) differs from existing token length (${tokens.length}).`
-          );
-          return;
-        }
-        // If length is the same, we can keep our existing clusterStates
-        setTokens(newTokens);
+      // If tokens changed in length for some reason, you could handle that:
+      if (newTokens.length !== tokens.length) {
+        console.warn(
+          `Token mismatch: got ${newTokens.length} from backend, but local is ${tokens.length}`
+        );
       }
 
-      // 2) Save topProbs & latentActivations
       setTopProbs(topProbs || {});
       setLatentActivations(latentActivations || null);
 
-      // 3) Recompute cluster activation fractions
+      // Compute cluster activation fractions
       if (latentActivations) {
-        computeClusterActivations(latentActivations, newTokens.length);
+        computeClusterActivations(latentActivations, tokens.length);
       } else {
         setActivationValues({});
       }
 
       setNeedRerun(false);
     } catch (err) {
-      console.error('Backend error:', err);
+      console.error('Error in /runWithLatentMask:', err);
     }
   }
 
-  // ----------------------------------------------------------------
   // Compute cluster activation fraction
-  // shape: latentActivations[tokenIdx][layerIndex][latentId]
-  // ----------------------------------------------------------------
-  function computeClusterActivations(activations: any, tokenCount: number) {
+  // shape is now: latentActivations[t][saeIndex] = { [latentId]: number }
+  function computeClusterActivations(
+    activations: Array<Array<Record<number, number>>>,
+    tokenCount: number
+  ) {
     if (!clusterStates) return;
     const newVals: any = {};
 
     for (let t = 0; t < tokenCount; t++) {
       for (const layerId of LAYERS) {
         const saeIndex = layerIndexMap[layerId];
-        const latArray = activations[t][saeIndex];
-        // If latArray is missing, skip
-        if (!latArray) continue;
+        const latMap = activations[t]?.[saeIndex]; // { [latentId]: number }
+        if (!latMap) continue;
 
         if (!newVals[layerId]) newVals[layerId] = {};
         if (!newVals[layerId][t]) newVals[layerId][t] = {};
 
-        // For each cluster in clusterStates
         const clusterMap = clusterStates[layerId][t];
-        for (const [clusterName, clusterObj] of Object.entries(clusterMap)) {
-          const cObj = clusterObj as {
-            enabled: boolean;
-            latents: Record<number, boolean>;
-          };
+        for (const [clusterName, clusterObj] of Object.entries(clusterMap || {})) {
+          const cObj = clusterObj as { enabled: boolean; latents: Record<number, boolean> };
           const enabledLatents = Object.entries(cObj.latents)
             .filter(([_, on]) => on)
             .map(([lid]) => parseInt(lid));
@@ -429,7 +477,7 @@ const CircuitVisualization = () => {
 
           let onCount = 0;
           for (const latentId of enabledLatents) {
-            if (latentId < latArray.length && latArray[latentId] > 0) {
+            if (latMap[latentId] && latMap[latentId] > 0) {
               onCount++;
             }
           }
@@ -441,12 +489,12 @@ const CircuitVisualization = () => {
     setActivationValues(newVals);
   }
 
+  //
   // ----------------------------------------------------------------
-  // Hover arrows logic
+  // 4) Hover arrows logic
   // ----------------------------------------------------------------
   function handleMouseEnter(layerId: number, colIndex: number) {
-    const col = columns[colIndex];
-    if (col.ablated) {
+    if (!columns[colIndex] || columns[colIndex].ablated) {
       setHoveredCell(null);
       setArrowLines([]);
       return;
@@ -473,6 +521,7 @@ const CircuitVisualization = () => {
     if (!hoveredEl) return lines;
     const hoveredCenter = getCellCenter(hoveredEl, tableRect);
 
+    // Example logic: connect all columns up to hoverColIndex
     for (let c = 0; c <= hoverColIndex; c++) {
       if (columns[c].ablated) continue;
       const aboveEl = cellRefs.current[`${aboveLayerId}-${c}`];
@@ -496,13 +545,12 @@ const CircuitVisualization = () => {
     };
   }
 
+  //
   // ----------------------------------------------------------------
-  // Render cluster cell
+  // 5) Render cluster cell
   // ----------------------------------------------------------------
   function ClusterCell({ layerId, col }: { layerId: number; col: any }) {
-    if (!clusterStates) {
-      return null;
-    }
+    if (!clusterStates) return null;
     if (col.ablated) {
       return (
         <div className="h-16 bg-gray-50 rounded-lg flex items-center justify-center">
@@ -510,13 +558,11 @@ const CircuitVisualization = () => {
         </div>
       );
     }
-    // We assume col.tokenIdxs has exactly 1 in normal usage
+    // Typically col.tokenIdxs has exactly 1 normal token
     const tokenIdx = col.tokenIdxs[0];
     const clusterMap = clusterStates[layerId][tokenIdx] || {};
     const clusterNames = Object.keys(clusterMap);
-
     if (!clusterNames.length) {
-      // treat as ablated
       return (
         <div className="h-16 bg-gray-50 rounded-lg flex items-center justify-center">
           (ablated)
@@ -530,7 +576,8 @@ const CircuitVisualization = () => {
           {clusterNames.map((clusterName) => {
             const info = clusterMap[clusterName];
             if (!info) return null;
-            const fraction = activationValues[layerId]?.[tokenIdx]?.[clusterName] ?? 0;
+
+            const fraction = activationValues?.[layerId]?.[tokenIdx]?.[clusterName] ?? 0;
             const percent = Math.round(fraction * 100);
             const latentsOn = Object.values(info.latents).filter(Boolean).length;
 
@@ -580,8 +627,9 @@ const CircuitVisualization = () => {
     );
   }
 
+  //
   // ----------------------------------------------------------------
-  // Dialog: cluster details
+  // 6) Dialog: cluster details
   // ----------------------------------------------------------------
   function ClusterDetails() {
     if (!selectedCell || !clusterStates) return null;
@@ -613,6 +661,7 @@ const CircuitVisualization = () => {
             {clusterNames.map((clusterName) => {
               const info = clusterMap[clusterName];
               const latents = Object.keys(info.latents).map(Number);
+
               return (
                 <div key={clusterName} className="border rounded p-3">
                   <div className="flex justify-between items-center mb-2">
@@ -629,9 +678,9 @@ const CircuitVisualization = () => {
                       // If we have latentActivations, show the value
                       let activationVal: number | null = null;
                       if (latentActivations) {
-                        const latArray = latentActivations[tokenIdx]?.[saeIndex];
-                        if (latArray && latentId < latArray.length) {
-                          activationVal = latArray[latentId];
+                        const latMap = latentActivations[tokenIdx]?.[saeIndex];
+                        if (latMap && typeof latMap[latentId] === 'number') {
+                          activationVal = latMap[latentId];
                         }
                       }
                       return (
@@ -655,13 +704,7 @@ const CircuitVisualization = () => {
                             disabled={!info.enabled}
                             checked={info.latents[latentId] || false}
                             onCheckedChange={(checked) =>
-                              toggleLatent(
-                                layerId,
-                                tokenIdx,
-                                clusterName,
-                                latentId,
-                                checked
-                              )
+                              toggleLatent(layerId, tokenIdx, clusterName, latentId, checked)
                             }
                           />
                         </div>
@@ -677,12 +720,13 @@ const CircuitVisualization = () => {
     );
   }
 
+  //
   // ----------------------------------------------------------------
-  // Render
+  // 7) Render
   // ----------------------------------------------------------------
   return (
     <div className="w-full max-w-6xl mx-auto p-4">
-      {/* Example selection and "run" */}
+      {/* Example selection + "Run" */}
       <Card className="mb-6">
         <CardHeader>
           <CardTitle className="flex justify-between items-center">
@@ -710,7 +754,7 @@ const CircuitVisualization = () => {
         <CardContent>
           {needRerun && (
             <div className="mb-2 p-2 text-sm font-medium text-yellow-800 bg-yellow-50 border-l-4 border-yellow-400 rounded">
-              You have changed the example or toggled latents. Click “Run” to see updated results.
+              You have changed tokens or toggled latents. Click “Run” to see updated results.
             </div>
           )}
           <div className="flex items-center gap-4">
@@ -733,9 +777,9 @@ const CircuitVisualization = () => {
           </CardTitle>
         </CardHeader>
         <CardContent>
-          {!latentActivations || !tokens.length ? (
+          {!clusterStates || !tokens.length ? (
             <div className="text-center p-4 text-gray-600 italic border rounded">
-              Click “Run” to fetch tokens & activations from the backend
+              No tokens yet. Please pick an example or wait for tokenization.
             </div>
           ) : (
             <div ref={tableRef} className="relative overflow-x-auto">
@@ -745,9 +789,7 @@ const CircuitVisualization = () => {
                     <th className="border p-2">SAE / Token</th>
                     {columns.map((col, cIdx) => (
                       <th key={cIdx} className="border p-2 text-center">
-                        {col.ablated
-                          ? `Ablated: ${col.label}`
-                          : col.label}
+                        {col.ablated ? 'Ablated' : col.label}
                       </th>
                     ))}
                   </tr>
@@ -762,9 +804,7 @@ const CircuitVisualization = () => {
                         <td
                           key={`${layerId}-${cIdx}`}
                           className="border p-2"
-                          ref={(el) =>
-                            (cellRefs.current[`${layerId}-${cIdx}`] = el)
-                          }
+                          ref={(el) => (cellRefs.current[`${layerId}-${cIdx}`] = el)}
                           onMouseEnter={() => handleMouseEnter(layerId, cIdx)}
                           onMouseLeave={handleMouseLeave}
                         >
