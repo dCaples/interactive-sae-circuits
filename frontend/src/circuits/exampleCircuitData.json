@@ -1,0 +1,32 @@
+{
+    "id": "dictionaryKeyTask",
+    "name": "Dictionary Key Error Task",
+    "layers": [
+      {
+        "layerId": 7,
+        "latents": [
+          {
+            "latentId": 450,
+            "conceptName": "duplicate token detect",
+            "activationSample": 9.53
+          },
+          {
+            "latentId": 1248,
+            "conceptName": "key name occurs twice",
+            "activationSample": 2.0
+          }
+        ]
+      },
+      {
+        "layerId": 14,
+        "latents": [
+          {
+            "latentId": 301,
+            "conceptName": "missing entity latents",
+            "activationSample": 0.127
+          }
+        ]
+      }
+    ]
+  }
+  
