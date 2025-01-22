@@ -39,7 +39,7 @@ LAYERS.forEach((layerId, idx) => {
   layerIndexMap[layerId] = idx;
 });
 
-// Global cluster definitions
+// Global cluster definitions (mock)
 const CLUSTERS: Record<
   number,
   Record<number, Record<string, number[]>>
@@ -72,6 +72,8 @@ const CLUSTERS: Record<
 // Helpers: initialize cluster states, check ablation, build columns
 // ----------------------------------------------------------------------
 function initClusterStatesForTokens(tokenCount: number) {
+  // For each layer+token, store a set of clusters,
+  // each cluster has { enabled, latents: { latentId -> bool } }
   const result: Record<
     number, // layerId
     Record<
@@ -166,53 +168,75 @@ function buildColumns(
 
 //
 // ----------------------------------------------------------------------
-// Build toggles & requested latents
+// UPDATED buildToggles => nested dict: layerId -> tokenIdx -> latentId -> 1.0
 // ----------------------------------------------------------------------
-// toggles[layerId][tokenIndex] = array of latents we want "on"
 function buildToggles(
   clusterStates: ReturnType<typeof initClusterStatesForTokens>,
   tokens: string[]
 ) {
-  const toggles: Record<number, Record<number, number[]>> = {};
+  /**
+   * Returns shape:
+   * {
+   *   "7": {
+   *     "0": { "77": 1.0, "78": 1.0 },
+   *     "1": { "100": 1.0 },
+   *     ...
+   *   },
+   *   "21": { ... },
+   *   ...
+   * }
+   * 
+   * - If a latent is off or the cluster is disabled, we simply omit that latentId from the dict.
+   * - The backend then treats missing or 0.0 as "discard."
+   */
+  const toggles: Record<string, Record<string, Record<string, number>>> = {};
+
   for (const layerId of LAYERS) {
-    toggles[layerId] = {};
+    toggles[String(layerId)] = {};
     for (let t = 0; t < tokens.length; t++) {
+      // Build an object of { latentIdStr: 1.0 }
       const clusterMap = clusterStates[layerId][t];
-      if (!clusterMap) {
-        toggles[layerId][t] = [];
-        continue;
-      }
-      const latentsOn: number[] = [];
-      for (const info of Object.values(clusterMap)) {
-        const cInfo = info as {
-          enabled: boolean;
-          latents: Record<number, boolean>;
-        };
-        if (cInfo.enabled) {
+      const togglesForToken: Record<string, number> = {};
+
+      if (clusterMap) {
+        for (const [clusterName, cInfo] of Object.entries(clusterMap)) {
+          // If cluster is disabled, skip all latents
+          if (!cInfo.enabled) continue;
+          // Otherwise, include all latents that are on
           for (const [latentIdStr, isOn] of Object.entries(cInfo.latents)) {
             if (isOn) {
-              latentsOn.push(parseInt(latentIdStr));
+              togglesForToken[latentIdStr] = 1.0;
             }
           }
         }
       }
-      toggles[layerId][t] = latentsOn;
+
+      toggles[String(layerId)][String(t)] = togglesForToken;
     }
   }
+
   return toggles;
 }
 
-/**
- * Build a "requestedLatents" object that includes ALL latents from CLUSTERS,
- * for each (layerId, tokenIdx), regardless of whether they're toggled on/off.
- * 
- * returned shape: {
- *   [layerId: number]: {
- *     [tokenIdx: number]: number[]  // array of latents
- *   }
- * }
- */
+//
+// ----------------------------------------------------------------------
+// Build "requestedLatents" for each (layerId, tokenIdx)
+// ----------------------------------------------------------------------
 function buildRequestedLatents(tokenCount: number) {
+  /**
+   * Return shape (in JS) like:
+   * {
+   *   7: {
+   *     0: [77, 78],
+   *     1: [100],
+   *     ...
+   *   },
+   *   21: { ... }
+   * }
+   * 
+   * After JSON serialization, the keys become strings, which the backend
+   * handles with .get(str(layer_id), {}).get(str(t), []).
+   */
   const requested: Record<number, Record<number, Set<number>>> = {};
 
   // Initialize sets
@@ -311,6 +335,7 @@ const CircuitVisualization = () => {
       // data has: { prompt, tokens }
       const newTokens = data.tokens || [];
       setTokens(newTokens);
+
       // Build clusterStates for these tokens
       const newCS = initClusterStatesForTokens(newTokens.length);
       setClusterStates(newCS);
@@ -401,8 +426,9 @@ const CircuitVisualization = () => {
       alert('No cluster states found. Try retokenizing first.');
       return;
     }
-    // Build toggles
+    // Build toggles (nested dict)
     const toggles = buildToggles(clusterStates, tokens);
+
     // Build requestedLatents
     const requestedLatents = buildRequestedLatents(tokens.length);
 
@@ -446,7 +472,7 @@ const CircuitVisualization = () => {
   }
 
   // Compute cluster activation fraction
-  // shape is now: latentActivations[t][saeIndex] = { [latentId]: number }
+  // shape: latentActivations[t][layerIndex] = { [latentId]: number }
   function computeClusterActivations(
     activations: Array<Array<Record<number, number>>>,
     tokenCount: number
