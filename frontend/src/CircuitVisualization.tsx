@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import {
@@ -13,9 +13,10 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip';
-import { ChevronLeft, ChevronRight, Play } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Play, Loader2 } from 'lucide-react';
 import { Switch } from '@/components/ui/switch';
 import { Checkbox } from '@/components/ui/checkbox';
+import Xarrow, { Xwrapper } from 'react-xarrows';
 import circuit from './circuit.json';
 
 //
@@ -33,7 +34,8 @@ const EXAMPLES = [
 // We assume these are the actual layers in ascending order
 const LAYERS = [7, 14, 21, 40];
 
-const CLUSTERS: Record<number, Record<number, Record<string, number[]>>> = circuit as any;
+const CLUSTERS: Record<number, Record<number, Record<string, number[]>>> =
+  circuit as any;
 
 function initClusterStatesForTokens(tokenCount: number) {
   const result: Record<
@@ -117,7 +119,6 @@ function buildColumns(
       ) {
         end++;
       }
-
       const chunk = tokens
         .slice(start, end)
         .map((t) => (t === '\n' ? '\\n' : t))
@@ -161,7 +162,6 @@ function buildToggleDictionaries(
         for (const [clusterName, cInfo] of Object.entries(clusterMap)) {
           const { enabled, latents } = cInfo;
           for (const [latentIdStr, isOn] of Object.entries(latents)) {
-            const latentId = parseInt(latentIdStr);
             if (enabled && isOn) {
               // "on" => keep => toggles=1
               togglesForToken[latentIdStr] = 1.0;
@@ -222,7 +222,7 @@ type LatentActivationsMap = {
   };
 };
 
-const CircuitVisualization = () => {
+export default function CircuitVisualization() {
   const [exampleIndex, setExampleIndex] = useState(0);
   const currentExample = EXAMPLES[exampleIndex];
 
@@ -244,19 +244,18 @@ const CircuitVisualization = () => {
     tokenIdx: number;
   }>(null);
 
-  const [hoveredCell, setHoveredCell] = useState<null | {
-    layerId: number;
-    colIndex: number;
-  }>(null);
-  const [arrowLines, setArrowLines] = useState<any[]>([]);
-  const tableRef = useRef<HTMLDivElement | null>(null);
-  const cellRefs = useRef<Record<string, HTMLTableCellElement | null>>({});
+  // For arrow animation
+  // -----------------------------------------
+  // We store connections row-by-row (an array of arrays).
+  const [connectionsByRow, setConnectionsByRow] = useState<any[]>([]);
+  // currentStage=0 => show no arrows, else show the row connections for currentStage-1
+  const [currentStage, setCurrentStage] = useState(0);
 
-  // Build the final columns (tokens) for display
-  const columns = clusterStates ? buildColumns(clusterStates, tokens) : [];
+  // Track loading state
+  const [isRunning, setIsRunning] = useState(false);
 
   // On page load, tokenize the first example
-  React.useEffect(() => {
+  useEffect(() => {
     fetchTokensForPrompt(currentExample);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -280,6 +279,9 @@ const CircuitVisualization = () => {
       setLatentActivations(null);
       setActivationValues({});
       setNeedRerun(true);
+
+      setConnectionsByRow([]);
+      setCurrentStage(0);
     } catch (err) {
       console.error('Error in /tokenize:', err);
     }
@@ -347,26 +349,32 @@ const CircuitVisualization = () => {
   }
 
   /**
-   * Build the toggles & zeroToggles from clusterStates,
-   * then POST to the backend to run the circuit.
+   * Main "run" function that:
+   * 1) Sends toggles + zeroToggles to the backend
+   * 2) Receives new topProbs + latentActivations
+   * 3) Computes clusterActivations
+   * 4) Builds the arrow connections
+   * 5) Animates arrow drawing, only one row of arrows at a time
    */
   async function runCircuit() {
     if (!clusterStates) {
       alert('No cluster states found. Try retokenizing first.');
       return;
     }
+    // Show loading spinner
+    setIsRunning(true);
 
-    // A) Convert clusterStates -> toggles + zeroToggles
+    // 1) Convert clusterStates -> toggles + zeroToggles
     const { toggles, zeroToggles } = buildToggleDictionaries(clusterStates, tokens);
 
-    // B) Also build a "requestedLatents" dict, so we retrieve final latents
+    // 2) Also build a "requestedLatents" dict, so we retrieve final latents
     const requestedLatents = buildRequestedLatents(tokens.length);
 
     try {
       const payload = {
         prompt: currentExample,
         toggles,
-        zeroToggles,       // <--- Pass the new zeroToggles
+        zeroToggles,
         requestedLatents,
       };
       const res = await fetch(`${BACKEND_URL}/runWithLatentMask`, {
@@ -389,6 +397,7 @@ const CircuitVisualization = () => {
       setTopProbs(topProbs || {});
       setLatentActivations(latentActivations || null);
 
+      // 3) If we got new latentActivations, compute clusterActivations
       if (latentActivations) {
         computeClusterActivations(latentActivations, tokens.length);
       } else {
@@ -396,8 +405,14 @@ const CircuitVisualization = () => {
       }
 
       setNeedRerun(false);
+
+      // 4) Build arrow connections + animate them
+      await buildAndAnimateArrows();
     } catch (err) {
       console.error('Error in /runWithLatentMask:', err);
+    } finally {
+      // Done loading
+      setIsRunning(false);
     }
   }
 
@@ -419,8 +434,8 @@ const CircuitVisualization = () => {
 
         for (const [clusterName, clusterObj] of Object.entries(clusterMap)) {
           const { enabled, latents } = clusterObj;
-          // If cluster is disabled, we might show 0 or skip; your choice
           if (!enabled) {
+            // If cluster is disabled, we show 0 (or skip)
             newVals[layerId][t][clusterName] = 0;
             continue;
           }
@@ -445,81 +460,137 @@ const CircuitVisualization = () => {
     setActivationValues(newVals);
   }
 
-  function handleMouseEnter(layerId: number, colIndex: number) {
-    if (!columns[colIndex] || columns[colIndex].ablated) {
-      setHoveredCell(null);
-      setArrowLines([]);
-      return;
+  /** 
+   * We treat each table cell with clusters as a "box". 
+   * Return 2D array tableLayout[row][col] = "box" if there's a cluster, "" otherwise.
+   */
+  function buildTableLayout(columns: any[]) {
+    if (!clusterStates) return [];
+    // rows = LAYERS.length, columns = columns.length
+    const layout = LAYERS.map(() => [] as string[]);
+    for (let r = 0; r < LAYERS.length; r++) {
+      for (let c = 0; c < columns.length; c++) {
+        const isAblated = columns[c].ablated;
+        if (!isAblated) {
+          // There's a single token index for this column
+          const tokenIdx = columns[c].tokenIdxs[0];
+          const clusterMap = clusterStates[LAYERS[r]]?.[tokenIdx];
+          if (clusterMap && Object.keys(clusterMap).length > 0) {
+            layout[r].push('box');
+          } else {
+            layout[r].push('');
+          }
+        } else {
+          // ablated => no clusters => ""
+          layout[r].push('');
+        }
+      }
     }
-    setHoveredCell({ layerId, colIndex });
-    setArrowLines(computeArrowLines(layerId, colIndex));
+    return layout;
   }
 
-  function handleMouseLeave() {
-    setHoveredCell(null);
-    setArrowLines([]);
-  }
+  /**
+   * Build connections row-by-row, from row i => row i+1.
+   * For each "box" in row i col c, connect it to row i+1 col c2 for all c2 >= c
+   * if row i+1 col c2 is also "box".
+   */
+  function buildConnections(layout: string[][]) {
+    const connections: any[] = [];
 
-  function computeArrowLines(hoverLayerId: number, hoverColIndex: number) {
-    const lines: any[] = [];
-    const rowIndex = LAYERS.indexOf(hoverLayerId);
-    if (rowIndex <= 0) return lines;
+    for (let row = 0; row < layout.length - 1; row++) {
+      const nextRow = row + 1;
+      const rowConnections = [];
 
-    const aboveLayerId = LAYERS[rowIndex - 1];
-    const tableRect = tableRef.current?.getBoundingClientRect();
-    if (!tableRect) return lines;
-
-    const hoveredEl = cellRefs.current[`${hoverLayerId}-${hoverColIndex}`];
-    if (!hoveredEl) return lines;
-    const hoveredCenter = getCellCenter(hoveredEl, tableRect);
-
-    // For demonstration, link from all columns <= colIndex
-    for (let c = 0; c <= hoverColIndex; c++) {
-      if (columns[c].ablated) continue;
-      const aboveEl = cellRefs.current[`${aboveLayerId}-${c}`];
-      if (!aboveEl) continue;
-      const aboveCenter = getCellCenter(aboveEl, tableRect);
-      lines.push({
-        x1: aboveCenter.x,
-        y1: aboveCenter.y,
-        x2: hoveredCenter.x,
-        y2: hoveredCenter.y,
-      });
+      for (let col = 0; col < layout[row].length; col++) {
+        if (layout[row][col] === 'box') {
+          // Look for boxes in the next row from col..end
+          for (let c = col; c < layout[nextRow].length; c++) {
+            if (layout[nextRow][c] === 'box') {
+              rowConnections.push({
+                start: `cell-r${row}-c${col}`,
+                end: `cell-r${nextRow}-c${c}`,
+              });
+            }
+          }
+        }
+      }
+      connections.push(rowConnections);
     }
-    return lines;
+    return connections;
   }
 
-  function getCellCenter(cellEl: HTMLTableCellElement, tableRect: DOMRect) {
-    const rect = cellEl.getBoundingClientRect();
-    return {
-      x: rect.left + rect.width / 2 - tableRect.left,
-      y: rect.top + rect.height / 2 - tableRect.top,
-    };
+  /**
+   * Build connections, store them in "connectionsByRow",
+   * then animate row by row, showing only a single row at a time.
+   */
+  async function buildAndAnimateArrows() {
+    if (!clusterStates) return;
+    // 1) Build table layout from cluster data
+    const cols = clusterStates ? buildColumns(clusterStates, tokens) : [];
+    const layout = buildTableLayout(cols);
+
+    // 2) Build connections from layout
+    const conByRow = buildConnections(layout);
+    setConnectionsByRow(conByRow);
+
+    // 3) Animate them. For each row i:
+    //   1) setCurrentStage = i+1 => show row i
+    //   2) wait some time for it to fully animate
+    //   3) hide them => setCurrentStage(0)
+    //   4) short pause
+    for (let i = 0; i < conByRow.length; i++) {
+      setCurrentStage(i + 1);   // reveal row i
+      await delay(1500);        // let the arrow draw
+      setCurrentStage(0);       // hide them
+      await delay(500);         // short gap before next
+    }
+  }
+
+  function delay(ms: number) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   function ClusterCell({ layerId, col }: { layerId: number; col: any }) {
     if (!clusterStates) return null;
+
+    // We'll give each cell a stable ID, used for Xarrow references
+    // layerId => row index, but let's find row index in LAYERS array
+    const rowIndex = LAYERS.indexOf(layerId);
+    const colIndex = col._colIndex; // We'll store _colIndex in the columns array below
+
     if (col.ablated) {
+      // Just an empty space
       return (
-        <div className="h-16 bg-gray-50 rounded-lg flex items-center justify-center">
-          (ablated)
+        <div
+          id={`cell-r${rowIndex}-c${colIndex}`}
+          className="h-16 bg-gray-50 rounded-lg flex items-center justify-center"
+        >
+          &nbsp;
         </div>
       );
     }
+
     const tokenIdx = col.tokenIdxs[0];
     const clusterMap = clusterStates[layerId][tokenIdx] || {};
     const clusterNames = Object.keys(clusterMap);
     if (!clusterNames.length) {
+      // Also empty if no cluster names
       return (
-        <div className="h-16 bg-gray-50 rounded-lg flex items-center justify-center">
-          (ablated)
+        <div
+          id={`cell-r${rowIndex}-c${colIndex}`}
+          className="h-16 bg-gray-50 rounded-lg flex items-center justify-center"
+        >
+          &nbsp;
         </div>
       );
     }
 
     return (
       <TooltipProvider>
-        <div className="h-16 p-1 flex flex-wrap gap-1 items-center justify-center flex-col">
+        <div
+          id={`cell-r${rowIndex}-c${colIndex}`}
+          className="h-16 p-1 flex flex-wrap gap-1 items-center justify-center flex-col bg-white border border-gray-200 rounded relative"
+        >
           {clusterNames.map((clusterName) => {
             const info = clusterMap[clusterName];
             if (!info) return null;
@@ -574,9 +645,6 @@ const CircuitVisualization = () => {
     );
   }
 
-  /* =======================
-     Dialog: cluster details
-     ======================= */
   function ClusterDetails() {
     if (!selectedCell || !clusterStates) return null;
     const { layerId, tokenIdx } = selectedCell;
@@ -644,7 +712,6 @@ const CircuitVisualization = () => {
                           </div>
 
                           <div className="flex items-center gap-2">
-                            {/* CHECKBOX for enabling/disabling latent */}
                             <Checkbox
                               disabled={!info.enabled}
                               checked={isLatentOn}
@@ -658,7 +725,6 @@ const CircuitVisualization = () => {
                                 )
                               }
                             />
-                            {/* Example: link to a "Neuronpedia" page */}
                             <Button variant="link" size="sm" asChild>
                               <a
                                 href={`https://www.neuronpedia.org/gemma-2-9b/${layerId}-gemmascope-res-16k/${latentId}`}
@@ -682,6 +748,16 @@ const CircuitVisualization = () => {
     );
   }
 
+  // Build the final columns (tokens) for display
+  const columns = clusterStates ? buildColumns(clusterStates, tokens) : [];
+  columns.forEach((col, idx) => {
+    (col as any)._colIndex = idx;
+  });
+
+  // Only show connections for the currentStage’s row (or none if stage=0)
+  const visibleConnections =
+    currentStage === 0 ? [] : connectionsByRow[currentStage - 1] || [];
+
   return (
     <div className="w-full max-w-6xl mx-auto p-4">
       {/* Example selection + Run */}
@@ -694,7 +770,7 @@ const CircuitVisualization = () => {
                 variant="outline"
                 size="icon"
                 onClick={handlePrevExample}
-                disabled={exampleIndex === 0}
+                disabled={exampleIndex === 0 || isRunning}
               >
                 <ChevronLeft className="h-4 w-4" />
               </Button>
@@ -702,7 +778,7 @@ const CircuitVisualization = () => {
                 variant="outline"
                 size="icon"
                 onClick={handleNextExample}
-                disabled={exampleIndex === EXAMPLES.length - 1}
+                disabled={exampleIndex === EXAMPLES.length - 1 || isRunning}
               >
                 <ChevronRight className="h-4 w-4" />
               </Button>
@@ -715,13 +791,22 @@ const CircuitVisualization = () => {
               You have changed tokens or toggled latents. Click “Run” to see updated results.
             </div>
           )}
-          <div className="flex flex-col items-left gap-4 overflow-x-auto">
-            <code className="flex-grow p-2 border rounded bg-gray-50 whitespace-pre">
+          <div className="flex flex-col  gap-4">
+            <code className="flex-grow p-2 border rounded bg-gray-50 whitespace-pre overflow-x-auto">
               {currentExample}
             </code>
-            <Button onClick={runCircuit}>
-              <Play className="h-4 w-4 mr-2" />
-              Run
+            <Button onClick={runCircuit} disabled={isRunning}>
+              {isRunning ? (
+                <>
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                  Running...
+                </>
+              ) : (
+                <>
+                  <Play className="h-4 w-4 mr-2" />
+                  Run
+                </>
+              )}
             </Button>
           </div>
         </CardContent>
@@ -738,80 +823,58 @@ const CircuitVisualization = () => {
               No tokens yet. Please pick an example or wait for tokenization.
             </div>
           ) : (
-            <div ref={tableRef} className="relative overflow-x-auto">
-              <table className="min-w-max border-collapse border">
-                <thead>
-                  <tr>
-                    <th className="border p-2">SAE / Token</th>
-                    {columns.map((col, cIdx) => (
-                      <th key={cIdx} className="border p-2 text-center">
-                        {col.ablated ? 'Ablated' : col.label}
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {LAYERS.map((layerId) => (
-                    <tr key={layerId}>
-                      <td className="border p-2 font-semibold text-center">
-                        SAE {layerId}
-                      </td>
+            // Wrap the table and arrows in Xwrapper
+            <Xwrapper>
+              <div style={{ position: 'relative', overflowX: 'auto' }}>
+                <table
+                  className="min-w-max border-collapse border"
+                  style={{ position: 'relative', zIndex: 1 }}
+                >
+                  <thead>
+                    <tr>
+                      <th className="border p-2">SAE / Token</th>
                       {columns.map((col, cIdx) => (
-                        <td
-                          key={`${layerId}-${cIdx}`}
-                          className="border p-2"
-                          ref={(el) => (cellRefs.current[`${layerId}-${cIdx}`] = el)}
-                          // onMouseEnter={() => handleMouseEnter(layerId, cIdx)}
-                          // onMouseLeave={handleMouseLeave}
-                        >
-                          <ClusterCell layerId={layerId} col={col} />
-                        </td>
+                        <th key={cIdx} className="border p-2 text-center">
+                          {col.ablated ? '' : col.label}
+                        </th>
                       ))}
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {LAYERS.map((layerId) => (
+                      <tr key={layerId}>
+                        <td className="border p-2 font-semibold text-center">
+                          SAE {layerId}
+                        </td>
+                        {columns.map((col, cIdx) => (
+                          <td key={`${layerId}-${cIdx}`} className="border p-2">
+                            <ClusterCell layerId={layerId} col={col} />
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
 
-              {/* Arrows for hovered cell */}
-              {hoveredCell && arrowLines.length > 0 && (
-                <svg
-                  style={{
-                    position: 'absolute',
-                    top: 0,
-                    left: 0,
-                    width: '100%',
-                    height: '100%',
-                    pointerEvents: 'none',
-                  }}
-                >
-                  <defs>
-                    <marker
-                      id="arrowhead"
-                      markerWidth="6"
-                      markerHeight="6"
-                      refX="5"
-                      refY="3"
-                      orient="auto"
-                      fill="gray"
-                    >
-                      <path d="M0,0 L0,6 L6,3 z" />
-                    </marker>
-                  </defs>
-                  {arrowLines.map((line, i) => (
-                    <line
-                      key={i}
-                      x1={line.x1}
-                      y1={line.y1}
-                      x2={line.x2}
-                      y2={line.y2}
-                      stroke="gray"
-                      strokeWidth="2"
-                      markerEnd="url(#arrowhead)"
-                    />
-                  ))}
-                </svg>
-              )}
-            </div>
+                {/* Render the "visible" arrows for the currently active row */}
+                {visibleConnections.map(({ start, end }, i) => (
+                  <Xarrow
+                    key={i}
+                    start={start}
+                    end={end}
+                    color="red"
+                    strokeWidth={2}
+                    animateDrawing={true}
+                    headSize={3}
+                    // anchor points at the center of each cell
+                    startAnchor="middle"
+                    endAnchor="middle"
+                    // raise zIndex so the arrow is on top
+                    zIndex={9999}
+                  />
+                ))}
+              </div>
+            </Xwrapper>
           )}
         </CardContent>
       </Card>
@@ -852,6 +915,4 @@ const CircuitVisualization = () => {
       <ClusterDetails />
     </div>
   );
-};
-
-export default CircuitVisualization;
+}
