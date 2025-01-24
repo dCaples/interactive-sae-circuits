@@ -138,7 +138,7 @@ function buildColumns(
 
 /**
  * Build two dictionaries for the backend:
- *  1) toggles  -> latents that are "on":     toggles=1 => keep
+ *  1) toggles     -> latents that are "on": toggles=1 => keep
  *  2) zeroToggles -> latents that are "off": zeroToggles=1 => forcibly zero
  */
 function buildToggleDictionaries(
@@ -540,9 +540,9 @@ export default function CircuitVisualization() {
     //   4) short pause
     for (let i = 0; i < conByRow.length; i++) {
       setCurrentStage(i + 1);   // reveal row i
-      await delay(1500);        // let the arrow draw
+      await delay(500);        // let the arrow draw
       setCurrentStage(0);       // hide them
-      await delay(500);         // short gap before next
+      await delay(200);         // short gap before next
     }
   }
 
@@ -612,20 +612,25 @@ export default function CircuitVisualization() {
                           : { layerId, tokenIdx }
                       )
                     }
-                    className={`relative px-2 py-1 rounded text-xs ${
+                    // UPDATED: fixed width at 160px
+                    className={`relative w-[160px] px-2 py-1 rounded text-xs ${
                       info.enabled
                         ? 'bg-blue-100 hover:bg-blue-200 border-blue-300'
                         : 'bg-gray-100 hover:bg-gray-200 border-gray-300'
-                    } border-l-4 transition-colors min-w-[40px] text-center`}
+                    } border-l-4 transition-colors text-center`}
                   >
                     <div className="font-medium">
                       {clusterName} ({latentsOn})
                     </div>
+
+                    {/* UPDATED: Grey track behind the blue-filled bar */}
                     {info.enabled && (
-                      <div
-                        className="absolute bottom-0 left-0 h-0.5 bg-blue-500"
-                        style={{ width: `${percent}%` }}
-                      />
+                      <div className="absolute bottom-0 left-0 w-full h-0.5 bg-gray-300">
+                        <div
+                          className="h-0.5 bg-red-500"
+                          style={{ width: `${percent}%` }}
+                        />
+                      </div>
                     )}
                   </button>
                 </TooltipTrigger>
@@ -864,7 +869,7 @@ export default function CircuitVisualization() {
                     end={end}
                     color="red"
                     strokeWidth={2}
-                    animateDrawing={true}
+                    animateDrawing={0.3}
                     headSize={3}
                     // anchor points at the center of each cell
                     startAnchor="middle"
