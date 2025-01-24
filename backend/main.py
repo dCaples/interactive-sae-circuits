@@ -1,154 +1,178 @@
-import random
+# main.py
+
+import uvicorn
 from fastapi import FastAPI, Body, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, List, Union
 
+# Import the relevant pieces from your inference.py
+# (Adjust the import path as needed to match your project’s structure)
+from inference import (
+    tokenizer,               # The global HF tokenizer
+    d_sae,                   # The latent dimension used by the SAEs
+    simple_run,              # The high-level function that runs ablation + inference
+)
+
+################################################################################
+# 1) Initialize app and set up CORS
+################################################################################
 app = FastAPI()
 
-# --------------------------------------------------
-# 1) Configure CORS
-# --------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, restrict to specific origins if needed
+    allow_origins=["*"],   # In production, tighten restrictions here
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --------------------------------------------------
-# 2) Mock Tokenizer
-# --------------------------------------------------
-memorized = {
-    'predict: ages["Bob"]': ["predict:", "ages", "[", '"Bob"', "]"],
-    'predict: prices["Apples"]': ["predict:", "prices", "[", '"Apples"', "]"],
-    'predict: dictionary["Hello"]': ["predict:", "dictionary", "[", '"Hello"', "]"],
-}
-
-def mock_tokenize(prompt: str) -> List[str]:
-    if prompt in memorized:
-        return memorized[prompt]
-    return prompt.split()
-
-# --------------------------------------------------
-# 3) Random or zero generation for latents
-# --------------------------------------------------
-def random_value() -> float:
-    """Return 0 or a random float in [0, 10) with 50/50 probability."""
-    return 0 if random.random() < 0.5 else 10 * random.random()
-
-# --------------------------------------------------
-# 4) Layers
-# --------------------------------------------------
-LAYERS = [7, 21, 40]
-
-# --------------------------------------------------
-# 5) Routes
-# --------------------------------------------------
-
+################################################################################
+# 2) /tokenize endpoint
+################################################################################
 @app.post("/tokenize")
 def tokenize_endpoint(data: Dict[str, Union[str, List[str]]] = Body(...)):
+    """
+    Expects JSON with {"prompt": <string>}.
+    Returns the raw tokens (as text) from the HF tokenizer.
+    """
     prompt = data.get("prompt")
     if not prompt or not isinstance(prompt, str):
         raise HTTPException(status_code=400, detail="Invalid or missing `prompt`")
 
-    tokens = mock_tokenize(prompt)
-    return {"prompt": prompt, "tokens": tokens}
+    # Tokenize the prompt
+    encoded = tokenizer(prompt, return_tensors="pt")
+    # Convert IDs -> string tokens
+    token_ids = encoded["input_ids"][0].tolist()
+    tokens = [tokenizer._convert_id_to_token(tid) for tid in token_ids]
 
+    return {
+        "prompt": prompt,
+        "tokens": tokens
+    }
+
+################################################################################
+# 3) /runWithLatentMask endpoint
+################################################################################
 @app.post("/runWithLatentMask")
 def run_with_latent_mask(data: Dict = Body(...)):
     """
-    Expects:
-      data = {
+    Expects JSON like:
+      {
         "prompt": <str>,
-        "toggles": {  # a nested dict specifying layer_idx->token_idx->latent_idx->mask_value
-          "7": {
-            "0": { "0": 1.0, "2": 0.25 },
-            "1": { "1": -1.5 },
+        "toggles": {
+          "<layer_idx>": {
+            "<token_idx>": { "<latent_idx>": <mask_value>, ... },
             ...
           },
-          "21": { ... },
           ...
         },
-        "requestedLatents": { # same or different structure telling us which latents to create
-          "7": {
-            "0": [0, 1, 2],
-            "1": [1],
+        "requestedLatents": { ... },   # optional dictionary for 'returning' latents
+        "zeroToggles": {               # optional dictionary specifying which latents
+          "<layer_idx>": {
+            "<token_idx>": { "<latent_idx>": <some_nonzero_value_to_zero>, ... },
             ...
           },
-          "21": { ... },
           ...
         }
       }
-    Returns the final latent activations after applying the toggles (mask).
+
+    We'll interpret any nonzero toggles[layer_idx][token_idx][latent_id] as "keep" (mask=1.0).
+    All latents not in toggles => ablated to mean.
+
+    Then, if zeroToggles is provided, any nonzero entry there is forcibly zeroed
+    after the mean ablation step.
     """
     prompt = data.get("prompt")
     toggles = data.get("toggles", {})
     requested_latents = data.get("requestedLatents", {})
+    zero_toggles = data.get("zeroToggles", {})
 
-    # 1) Validate required fields
-    if not prompt or not toggles or not requested_latents:
+    # Validate required fields for the primary "keep" toggles
+    if not prompt or not toggles:
         raise HTTPException(
             status_code=400,
-            detail="Missing required fields: prompt, toggles, requestedLatents"
+            detail="Missing required fields: `prompt` or `toggles`"
         )
 
-    # 2) Tokenize prompt
-    tokens = mock_tokenize(prompt)
-    num_tokens = len(tokens)
+    # ----------------------------------------------------------------------------
+    # (A) Convert toggles -> keep_dict (for mean ablation)
+    # ----------------------------------------------------------------------------
+    keep_dict = {}
+    for layer_str, token_dict in toggles.items():
+        layer_idx = int(layer_str)
+        keep_dict[layer_idx] = {}
 
-    # 3) Build minimal structure: latentActivations[t][layerIndex] = { latentId: randomNumber }
-    latent_activations = []
-    for t in range(num_tokens):
-        # For each token, build a list (in parallel with LAYERS)
-        sae_list = []
-        for layer_id in LAYERS:
-            latents_for_this_cell = requested_latents.get(str(layer_id), {}).get(str(t), [])
-            lat_map = {}
-            for latent_id in latents_for_this_cell:
-                # Convert to str to match the toggles dict keys
-                latent_id_str = str(latent_id)
-                lat_map[latent_id_str] = random_value()
-            sae_list.append(lat_map)
-        latent_activations.append(sae_list)
+        for token_str, latent_map in token_dict.items():
+            token_idx = int(token_str)
+            latents_to_keep = []
+            for latent_str, mask_val in latent_map.items():
+                if mask_val != 0.0:  # Non-zero => keep this latent
+                    latents_to_keep.append(int(latent_str))
 
-    # 4) Apply toggles using the nested-dict structure
-    #    toggles[layer_id][token_idx] = { latent_idx: mask_value, ... }
-    for t in range(num_tokens):
-        for layer_idx, layer_id in enumerate(LAYERS):
-            # toggles_for_layer = toggles.get(str(layer_id), {})
-            toggles_for_token = toggles.get(str(layer_id), {}).get(str(t), {})
-            lat_map = latent_activations[t][layer_idx]
+            if len(latents_to_keep) > 0:
+                keep_dict[layer_idx][token_idx] = latents_to_keep
 
-            for latent_id_str in list(lat_map.keys()):
-                # If toggles_for_token is missing or has a zero-value, discard
-                mask_val = toggles_for_token.get(latent_id_str, 0.0)
-                if mask_val == 0.0:
-                    lat_map[latent_id_str] = 0.0
-                else:
-                    # Option A: Keep the original random activation as is
-                    pass
+    # ----------------------------------------------------------------------------
+    # (B) Convert zeroToggles -> zero_dict (for zero ablation)
+    # ----------------------------------------------------------------------------
+    zero_dict = {}
+    if zero_toggles:
+        for layer_str, token_dict in zero_toggles.items():
+            layer_idx = int(layer_str)
+            zero_dict[layer_idx] = {}
 
-                    # Option B (commented out): Multiply by mask_val
-                    # lat_map[latent_id_str] = lat_map[latent_id_str] * mask_val
+            for token_str, latent_map in token_dict.items():
+                token_idx = int(token_str)
+                latents_to_zero = []
+                for latent_str, val in latent_map.items():
+                    if val != 0.0:  # Non-zero => forcibly zero out
+                        latents_to_zero.append(int(latent_str))
 
-                    # Option C (commented out): Replace with the mask_val
-                    # lat_map[latent_id_str] = mask_val
+                if len(latents_to_zero) > 0:
+                    zero_dict[layer_idx][token_idx] = latents_to_zero
+    else:
+        zero_dict = None
 
-    # 5) Dummy "topProbs"
-    top_probs = {
-        "Traceback": random.random(),
-        "1": random.random(),
-        ">>>": random.random()
-    }
+    # ----------------------------------------------------------------------------
+    # (C) Run the actual inference with ablation
+    # ----------------------------------------------------------------------------
+    top_tokens_dict, final_activations = simple_run(
+        text=prompt,
+        latents_dict=keep_dict,
+        requested_return_dict=requested_latents,
+        zero_latents_dict=zero_dict  # <--- new argument for zero ablations
+    )
 
-    # 6) Return final
+    # ----------------------------------------------------------------------------
+    # (D) Format the top tokens result
+    # ----------------------------------------------------------------------------
+    # `top_tokens_dict` is something like { "<token_str>": probability_value, ... }
+    top_probs = top_tokens_dict
+
+    # ----------------------------------------------------------------------------
+    # (E) Tokenize prompt for returning tokens in the response
+    # ----------------------------------------------------------------------------
+    encoded = tokenizer(prompt, return_tensors="pt")
+    token_ids = encoded["input_ids"][0].tolist()
+    tokens_list = [tokenizer._convert_id_to_token(tid) for tid in token_ids]
+
+    # ----------------------------------------------------------------------------
+    # (F) Return the final JSON structure
+    # ----------------------------------------------------------------------------
     return {
         "prompt": prompt,
-        "tokens": tokens,
+        "tokens": tokens_list,
         "toggles": toggles,
+        "zeroToggles": zero_toggles,
         "result": {
             "topProbs": top_probs,
-            "latentActivations": latent_activations,
+            "latentActivations": final_activations
         },
     }
+
+################################################################################
+# 4) Optional: Run via `python main.py`
+################################################################################
+if __name__ == "__main__":
+    # By default, this will run on http://127.0.0.1:8000
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

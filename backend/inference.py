@@ -1,4 +1,3 @@
-# %%
 import random
 import torch
 import torch.nn.functional as F
@@ -15,6 +14,7 @@ torch.set_default_device('cuda')
 
 # custom SAE code
 from sae_lens import SAE
+
 
 ################################################################################
 # 1. DATASET
@@ -64,9 +64,6 @@ def generate_extended_dataset(name_pool, num_samples=5):
         })
     return dataset
 
-
-import torch
-
 class ContrastiveDatasetBatch:
     """
     - Takes a subset of items
@@ -90,29 +87,12 @@ class ContrastiveDatasetBatch:
         # Tokenize all prompts together
         # ----------------------------------------
         all_prompts = correct_prompts + error_prompts
-        self.all_tokenized = tokenizer(all_prompts, return_tensors="pt", padding=True)['input_ids']
+        self.all_tokenized = self.tokenizer(all_prompts, return_tensors="pt", padding=True)['input_ids'].to(self.device)
+
+        # (Omitted some code that used to be here - not strictly needed for the example)
 
         # ----------------------------------------
-        # Tokenize correct prompts and error prompts separately
-        # ----------------------------------------
-        correct_tokenized = tokenizer(correct_prompts, return_tensors="pt", padding=True)['input_ids']
-        error_tokenized   = tokenizer(error_prompts,   return_tensors="pt", padding=True)['input_ids']
-
-        # Move to device
-        # self.correct_tokenized = {k: v.to(device) for k, v in correct_tokenized.items()}
-        # self.error_tokenized   = {k: v.to(device) for k, v in error_tokenized.items()}
-
-        # ----------------------------------------
-        # Final non-pad index (last valid token)
-        # ----------------------------------------
-        # correct_mask = self.correct_tokenized['attention_mask']
-        # error_mask   = self.error_tokenized['attention_mask']
-
-        # self.correct_last_nonpad = correct_mask.sum(dim=-1) - 1  # shape [batch_size]
-        # self.error_last_nonpad   = error_mask.sum(dim=-1) - 1    # shape [batch_size]
-
-        # ----------------------------------------
-        # Label extraction
+        # Single-token labels for correct / error
         # ----------------------------------------
         def single_token_id(response_str):
             # Convert response to a single token ID (or 2 tokens, we pick the second if possible)
@@ -122,23 +102,18 @@ class ContrastiveDatasetBatch:
             else:
                 return t[0, -1]
 
-        # Get responses for correct / error
         correct_responses = [ex["response"] for ex in self.correct_batch]
         error_responses   = [ex["response"] for ex in self.error_batch]
 
-        # Single-token labels for correct / error
         correct_labels = [single_token_id(r) for r in correct_responses]
         error_labels   = [single_token_id(r) for r in error_responses]
+        
+        self.correct_labels = torch.tensor(correct_labels, dtype=torch.long, device=self.device)
+        self.error_labels   = torch.tensor(error_labels,   dtype=torch.long, device=self.device)
 
-        self.correct_labels = torch.tensor(correct_labels, dtype=torch.long, device=device)
-        self.error_labels   = torch.tensor(error_labels,   dtype=torch.long, device=device)
-
-        # ----------------------------------------
-        # All labels in the same order as all_tokenized
-        # ----------------------------------------
         all_responses = correct_responses + error_responses
         all_labels    = [single_token_id(r) for r in all_responses]
-        self.all_labels = torch.tensor(all_labels, dtype=torch.long, device=device)
+        self.all_labels = torch.tensor(all_labels, dtype=torch.long, device=self.device)
 
 
 ################################################################################
@@ -157,8 +132,9 @@ def load_model_and_saes():
     tokenizer = AutoTokenizer.from_pretrained("google/gemma-2-9b")
     model_raw = AutoModelForCausalLM.from_pretrained(
         "google/gemma-2-9b",
-        quantization_config=quant_config,
-        device_map="auto"  # for accelerate or bitsandbytes
+        # quantization_config=quant_config,
+        torch_dtype=torch.float16,
+        device_map="auto"
     )
 
     # Wrap with NNsight
@@ -169,9 +145,6 @@ def load_model_and_saes():
     l0s   = [92, 67, 129, 125]
     saes  = []
     for layer, l0_val in zip(layers, l0s):
-        # Adapt your SAE loading code as needed:
-        # e.g. SAE.from_pretrained(...)
-        # For demonstration, we create a dummy SAE below. Replace with real.
         sae_obj = SAE.from_pretrained(
             release="gemma-scope-9b-pt-res",
             sae_id=f"layer_{layer}/width_16k/average_l0_{l0_val}",
@@ -192,13 +165,10 @@ def load_model_and_saes():
         component_dict[layer] = wrapped_model.model.layers[layer]
         sae_dict[layer] = saes[i]
 
-
     return tokenizer, wrapped_model, saes, sae_dict, component_dict
 
-# %%
 tokenizer, wrapped_model, saes, sae_dict, component_dict = load_model_and_saes()
 
-# %%
 extended_name_pool = [
     "Bob", "Sam", "Lilly", "Rob", "Alice", "Charlie", "Sally", "Tom", "Jake", "Emily", 
     "Megan", "Chris", "Sophia", "James", "Oliver", "Isabella", "Mia", "Jackson", 
@@ -206,121 +176,51 @@ extended_name_pool = [
 ]
 full_dataset = generate_extended_dataset(extended_name_pool, num_samples=200)
 
+test_items = ContrastiveDatasetBatch(full_dataset[-10:], tokenizer)
+seq_len = test_items.all_tokenized.shape[-1]
+
+# Suppose we already have the mean ablations stored
+mean_ablation_dict = torch.load("./mean_ablate.pt")
+
+d_sae = saes[0].cfg.d_sae
+assert seq_len == 65, "sequence length is expected to be 65"
 
 
-# %%
+################################################################################
+# 3. Ablation Helpers
+################################################################################
+
 def assert_tuple(x):
     assert isinstance(x, tuple), "must be tuple tensor"
 
-
-# %%
-# mean_items = ContrastiveDatasetBatch(full_dataset[:30], tokenizer)
-
-# mean_ablation_dict = {}
-
-
-# with wrapped_model.trace(mean_items.all_tokenized):
-#     for key, value in component_dict.items():
-#         component = value
-#         sae = sae_dict[key]
-#         output = component.output
-#         nnsight_apply(assert_tuple, output)
-        
-#         mean_ablation_dict[key] = sae.encode(output[0]).mean(dim=0).save()
-
-
-# %%
-mean_ablation_dict = torch.load("./mean_ablate.pt")
-
-# %%
-test_items = ContrastiveDatasetBatch(full_dataset[-10:], tokenizer)
-
-d_sae = saes[0].cfg.d_sae
-seq_len = test_items.all_tokenized.shape[-1]
-
-assert seq_len == 65, "sequence length is expected to be 65"
-
-# %%
-def run_ablated_model(tokenized, sae_mask_dict):
-
-    def ablated_sae(input, tokens, sae, mean_ablation, mask):
-        special_tokens_mask = torch.isin(tokens, torch.tensor(tokenizer.all_special_ids, dtype=torch.int64)) # true on special tokens (ie BOS)
-        sae_acts = sae.encode(input)
-        mean_input_diff = sae_acts - mean_ablation # add this to mean_ablation to get original value
-        masked_sae_acts = mean_ablation + mean_input_diff * mask # where mask=1, let the input pass through else mean ablate
-        masked_sae_acts[special_tokens_mask] *= 0 # zero out special tokens for clarity
-        sae_out = sae.decode(masked_sae_acts)
-        sae_out = sae_out.to(torch.float16)
-        sae_out[special_tokens_mask] = input[special_tokens_mask] # replace with non-sae acts on special toks
-        return sae_out, masked_sae_acts
-
-    sae_acts = {}
-    with wrapped_model.trace(tokenized):
-        for k,component in component_dict.items():
-            sae = sae_dict[k]
-            mean_ablation = mean_ablation_dict[k]
-            mask = sae_mask_dict[k]
-            output = component.output
-            nnsight_apply(assert_tuple, output)
-            
-            sae_input = output[0] # tensor inside tuple
-            sae_output, masked_sae_acts = ablated_sae(
-                input = sae_input, 
-                tokens = tokenized,
-                sae = sae,
-                mean_ablation=mean_ablation,
-                mask=mask
-                )
-            sae_acts[k] = masked_sae_acts.save()
-            component.output = (sae_output,)
-        
-        output = wrapped_model.output.save()        
-
-    model_out = torch.topk(torch.softmax(output.logits[:, -1, :], dim=-1), k=3)
-
-    top_tokens = [tokenizer.convert_ids_to_tokens(model_out.indices[i]) for i in range(len(model_out.indices))]
-    top_values = model_out.values
-    return top_tokens, top_values, sae_acts
-
-# %%
-def run_ablated_model_demo():
-    sae_mask_dict = {}
-    for k, v in sae_dict.items():
-        sae_mask_dict[k] = torch.rand(seq_len, d_sae)<0.9
-
-    tokens = test_items.all_tokenized[0:1]
-
-    return run_ablated_model(tokens, sae_mask_dict)
-run_ablated_model_demo()
-
-# %%
 def keep_dict_to_mask_tensor(keep_dict: dict, seq_len: int, d_sae: int) -> dict:
     """
     Reconstruct the (seq_len x d_sae) mask tensors from a nested dict of
     {layer_idx: { token_idx: [latent_idx1, latent_idx2, ...], ... }, ...}.
-
-    - keep_dict: the nested dict created by mask_tensor_to_keep_dict
-    - seq_len:   the sequence length (number of tokens)
-    - d_sae:     the latent dimension
-
-    Returns:
-      A dictionary {layer_idx -> (seq_len x d_sae) mask_tensor}.
+    Returns a {layer_idx -> (seq_len x d_sae) tensor} with 1.0=keep, 0.0=not-keep.
     """
     sae_mask_dict = {}
-
     for layer_idx, layer_dict in keep_dict.items():
-        # Initialize a zero tensor for the mask
         mask_tensor = torch.zeros(seq_len, d_sae, dtype=torch.float16)
-
-        # For each token_idx in that layer
         for token_idx, latent_indices in layer_dict.items():
-            # For each latent dimension to keep
             for latent_idx in latent_indices:
                 mask_tensor[token_idx, latent_idx] = 1.0
-
         sae_mask_dict[layer_idx] = mask_tensor
-
     return sae_mask_dict
+
+def zero_dict_to_mask_tensor(zero_dict: dict, seq_len: int, d_sae: int) -> dict:
+    """
+    Similar structure to `keep_dict_to_mask_tensor`, but for latents you want to set to zero.
+    Returns a {layer_idx -> (seq_len x d_sae) tensor} with 1.0=zero out, 0.0=don’t zero out.
+    """
+    sae_zero_mask_dict = {}
+    for layer_idx, layer_dict in zero_dict.items():
+        mask_tensor = torch.zeros(seq_len, d_sae, dtype=torch.float16)
+        for token_idx, latent_indices in layer_dict.items():
+            for latent_idx in latent_indices:
+                mask_tensor[token_idx, latent_idx] = 1.0
+        sae_zero_mask_dict[layer_idx] = mask_tensor
+    return sae_zero_mask_dict
 
 def mask_tensor_to_value_dict(
     sae_mask_dict: dict, 
@@ -330,123 +230,229 @@ def mask_tensor_to_value_dict(
     Convert a dictionary of {layer_idx -> (seq_len x d_sae) mask tensors}
     into a nested dict specifying which token & latent dims do NOT match the
     discard_value, and what those values are.
-
-    For each layer’s mask, we look for entries != discard_value.
-    Then we store them as:
-      {
-        layer_idx: {
-          token_idx: {
-            latent_idx: <mask_value>,
-            ...
-          },
-          ...
-        },
-        ...
-      }
-    Args:
-        sae_mask_dict: Dict of {layer_idx -> mask_tensor}, each mask_tensor of shape [seq_len, d_sae].
-        discard_value: Any float value that should be treated as "discard." Defaults to 0.0.
-
-    Returns:
-        A nested dictionary of the structure described above, containing
-        all entries that are not equal to discard_value.
     """
     value_dict = {}
-
     for layer_idx, mask_tensor in sae_mask_dict.items():
-        # Find all positions where the mask is not the discard_value
         keep_positions = (mask_tensor != discard_value).nonzero(as_tuple=False)
-
         if keep_positions.shape[0] == 0:
-            # No entries to keep => store empty dict
             value_dict[layer_idx] = {}
             continue
-
         layer_dict = {}
         for token_idx, latent_idx in keep_positions:
             token_idx = token_idx.item()
             latent_idx = latent_idx.item()
-
-            # Get the actual mask value at that position
             val = mask_tensor[token_idx, latent_idx].item()
-
             if token_idx not in layer_dict:
                 layer_dict[token_idx] = {}
             layer_dict[token_idx][latent_idx] = val
-
         value_dict[layer_idx] = layer_dict
-
     return value_dict
 
 
+################################################################################
+# 4. run_ablated_model with optional zero ablation
+################################################################################
+
+def run_ablated_model(tokenized, sae_keep_mask_dict, sae_zero_mask_dict=None):
+    """
+    1) For each layer:
+       - encode -> SAE latents
+       - mean ablate everything that is not keep_mask=1
+       - if sae_zero_mask_dict is provided, set those latents to 0 afterwards
+       - decode -> layer hidden states
+       - store the final SAE latents to sae_acts
+    2) Return top tokens, probabilities, and final sae_acts
+    """
+
+    def ablated_sae(input_hidden, tokens, sae, mean_ablation, keep_mask, zero_mask):
+        # encode to SAE space
+        sae_acts = sae.encode(input_hidden)
+
+        # difference from mean
+        mean_input_diff = sae_acts - mean_ablation
+
+        # mean ablation for not-kept latents
+        masked_sae_acts = mean_ablation + mean_input_diff * keep_mask
+
+        # optional step: zero out latents in zero_mask
+        if zero_mask is not None:
+            masked_sae_acts[:, zero_mask.bool()] = 0.0
+
+        # decode back
+        sae_out = sae.decode(masked_sae_acts).to(torch.float16)
+
+        # Special tokens pass-through (if you want them unaffected)
+        special_tokens_mask = torch.isin(
+            tokens, 
+            torch.tensor(tokenizer.all_special_ids, dtype=torch.int64, device=tokens.device)
+        )
+        sae_out[special_tokens_mask] = input_hidden[special_tokens_mask]
+
+        return sae_out, masked_sae_acts
+
+    sae_acts = {}
+
+    with wrapped_model.trace(tokenized):
+        for layer_idx, component in component_dict.items():
+            sae = sae_dict[layer_idx]
+            output = component.output
+            nnsight_apply(assert_tuple, output)
+
+            # retrieve the mean ablation vector for this layer
+            mean_ablation = mean_ablation_dict[layer_idx]
+
+            # get the keep mask for this layer
+            if layer_idx in sae_keep_mask_dict:
+                keep_mask = sae_keep_mask_dict[layer_idx]
+            else:
+                # if not specified, default to 0.0 => mean ablate everything
+                keep_mask = torch.zeros_like(mean_ablation)
+
+            # get zero mask for this layer (if any)
+            zero_mask = None
+            if sae_zero_mask_dict is not None:
+                zero_mask = sae_zero_mask_dict.get(layer_idx, None)
+
+            input_hidden = output[0]
+            sae_out, masked_sae_acts = ablated_sae(
+                input_hidden=input_hidden,
+                tokens=tokenized,
+                sae=sae,
+                mean_ablation=mean_ablation,
+                keep_mask=keep_mask,
+                zero_mask=zero_mask
+            )
+
+            # store the final SAE latents (after zero-ablation if any)
+            sae_acts[layer_idx] = masked_sae_acts.save()
+
+            # override the output hidden states
+            component.output = (sae_out,)
+
+        # final forward pass from last layer
+        final = wrapped_model.output.save()
+
+    # get top tokens
+    logits = final.logits
+    model_out = torch.topk(torch.softmax(logits[:, -1, :], dim=-1), k=3)
+    top_tokens = [tokenizer.convert_ids_to_tokens(model_out.indices[i]) for i in range(len(model_out.indices))]
+    top_values = model_out.values
+
+    return top_tokens, top_values, sae_acts
+
+
+################################################################################
+# 5. Simple Run
+################################################################################
 
 def simple_run(
     text: str,
     latents_dict: dict,
     requested_return_dict: dict,
+    zero_latents_dict: dict | None = None
 ):
     """
     1) Tokenize `text`.
-    2) Build a 'keep' mask dict => everything not mentioned is ablated (0).
-    3) Use run_ablated_model(...) with that mask.
-    4) Re-encode the final hidden states at each relevant layer to get the final latents
-       for exactly the positions we 'kept'.
+    2) Build a 'keep' mask dict => everything not mentioned is ablated to mean.
+    3) Optionally build a 'zero' mask dict => latents here are forced to zero.
+    4) Run the ablated model.
     5) Return top tokens, top probabilities, and final-latents dictionary.
-
-    Requirements:
-    - run_ablated_model(tokenized, sae_mask_dict) must be in scope.
-      * That function expects: 1 => pass original, 0 => ablate to mean.
     """
 
-    # # 1) Tokenize text (batch=1)
+    # 1) Tokenize
     tokenized = tokenizer(text, return_tensors="pt").input_ids.to("cuda")
     seq_len = tokenized.shape[1]
-    assert seq_len == 65, "expected seq len 65 for circuit demo"
+    if seq_len != 65:
+        print(f"Warning: expected seq_len=65 but got {seq_len}")
 
-    # 2) Convert latents_dict => mask_tensors (1=keep, 0=ablate)
-    #    i.e. everything not in latents_dict is ablated (0)
-    sae_mask_dict = keep_dict_to_mask_tensor(
+    # 2) Convert latents_dict => keep mask (1=keep, 0=ablate-to-mean)
+    sae_keep_mask_dict = keep_dict_to_mask_tensor(
         keep_dict=latents_dict,
         seq_len=seq_len,
         d_sae=d_sae,
     )
 
-    # print(sae_mask_dict)
+    # 3) Convert zero_latents_dict => zero mask (1=force-to-zero, 0=do-nothing)
+    if zero_latents_dict is not None:
+        sae_zero_mask_dict = zero_dict_to_mask_tensor(
+            zero_dict=zero_latents_dict,
+            seq_len=seq_len,
+            d_sae=d_sae
+        )
+    else:
+        sae_zero_mask_dict = None
 
+    # 4) Run the ablated model
+    top_tokens, top_values, sae_acts = run_ablated_model(
+        tokenized, 
+        sae_keep_mask_dict=sae_keep_mask_dict, 
+        sae_zero_mask_dict=sae_zero_mask_dict
+    )
 
-    # 3) Run the ablated model
-    top_tokens, top_values, sae_acts = run_ablated_model(tokenized, sae_mask_dict)
-
-    # elementwise product of mask and sae_acts
+    # Post-process: Keep only the latents that we actually "kept" for output
     saved_activations = {}
-    for k, v in sae_acts.items():
-        saved_activations[k] =  sae_acts[k][0]
-        sae_mask_dict[k] = sae_mask_dict[k].to(torch.bool)
-        saved_activations[k][~sae_mask_dict[k]] = -1
+    for layer_idx, final_latents in sae_acts.items():
+        # final_latents is shape [seq_len, d_sae], for batch=1
+        final_latents = final_latents[0]  # remove batch dim
+
+        # convert keep_mask -> bool
+        keep_mask = sae_keep_mask_dict.get(layer_idx, torch.zeros_like(final_latents)).bool()
+        # set latents we do not keep to -1 so user can see they were not kept
+        final_latents[~keep_mask] = -1
+
+        # also if you want to reflect zero latents, you can do so,
+        # but you'd see them directly in the final_latents anyway.
+
+        saved_activations[layer_idx] = final_latents
+
+    # Convert to nested dictionary structure
     saved_activations = mask_tensor_to_value_dict(saved_activations, discard_value=-1)
-    
 
-    # squeeze the batch dim
-    top_tokens = top_tokens[0]
+    # 5) Format the top tokens + values
+    top_tokens = top_tokens[0]  # batch=1
     top_values = top_values[0]
-
-
 
     top_tokens_dict = {}
     for i, token in enumerate(top_tokens):
         top_tokens_dict[token] = top_values[i].item()
 
-    return(top_tokens_dict, saved_activations)
+    return top_tokens_dict, saved_activations
 
 
+################################################################################
+# 6. Usage Example
+################################################################################
 
 def main():
-    dict_circuit = {7: {62: [10768, 11635]}, 14: {62: [1724, 1788, 2576, 3805, 4811, 4834, 6868, 8269, 8746, 9066, 11766, 12929, 15603], 63: [8746]}, 21: {62: [534, 6740, 7015, 11455], 63: [712, 3076, 5066, 5880, 8255, 9551, 10824, 11416, 12314], 64: [52, 712, 1197, 1408, 4351, 6650, 7192, 8082, 8127, 9551, 10003, 12314, 12598, 13546, 14515]}, 40: {64: [215, 266, 637, 1073, 1322, 1435, 2295, 2493, 2534, 2664, 2881, 2930, 2964, 2996, 3056, 3685, 3960, 4501, 4603, 4689, 4769, 5862, 6619, 6742, 7622, 7792, 8416, 8778, 9230, 9309, 9447, 9682, 10069, 10155, 10316, 10628, 10936, 10993, 11066, 11103, 11403, 11579, 11706, 11839, 12037, 12258, 12735, 12988, 13095, 13113, 13479, 13967, 14423, 14504, 15628, 15705, 15851, 16039]}}
-    top_tokens_dict, sae_acts = simple_run(test_items.correct_batch[0]['prompt'], dict_circuit, dict_circuit)
-    print("top tokens:")
+    # Example "keep" dict (the circuit you want to keep)
+    dict_circuit = {
+        7:  {62: [10768, 11635]}, 
+        14: {62: [1724, 1788], 63: [8746]}, 
+        21: {62: [534, 6740], 63: [712, 3076], 64: [52, 712]},
+        40: {64: [215, 266, 637]} 
+    }
+
+    # Example "zero" dict: latents to forcibly set to zero after mean ablation
+    dict_zero = {
+        14: {63: [8746]},  # forcibly set layer=14, token=63, latents=[8746] to zero
+        40: {64: [637]}    # forcibly set layer=40, token=64, latents=[637] to zero
+    }
+
+    # Use the correct prompt from the last test item
+    text = test_items.correct_batch[0]['prompt']
+
+    top_tokens_dict, sae_acts = simple_run(
+        text=text,
+        latents_dict=dict_circuit,
+        requested_return_dict=dict_circuit,
+        zero_latents_dict=dict_zero
+    )
+    
+    print("=== Top Tokens ===")
     print(top_tokens_dict)
-    print("sae acts:")
+    print("=== Final SAE Latents (Mask Dictionary) ===")
     print(sae_acts)
+
 
 if __name__ == "__main__":
     main()

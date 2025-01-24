@@ -1,3 +1,4 @@
 **/node_modules/*
 repomix-output.txt
 backend/__pycache__/main.cpython-310.pyc
+nohup.out
